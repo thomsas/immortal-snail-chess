@@ -69,7 +69,7 @@ html,body{margin:0;padding:0;height:100%;overflow:hidden;background:#1e2227;colo
 .sq .dot{position:absolute;width:30%;height:30%;border-radius:50%;background:rgba(0,0,0,.28);pointer-events:none;z-index:2}
 .sq .ring{position:absolute;top:4%;right:4%;bottom:4%;left:4%;border-radius:50%;border:calc(var(--bs)/90) solid rgba(0,0,0,.3);pointer-events:none;z-index:2}
 .pc{font-variant-emoji:text;position:relative;z-index:1;pointer-events:none}
-.sn{font-variant-emoji:emoji}.pw{color:#fff;text-shadow:0 0 2px #000,0 0 2px #000,0 0 1px #000}.pb{color:#111;text-shadow:0 0 2px #fff}
+.sn{font-variant-emoji:emoji;border-radius:50%;width:84%;height:84%;display:flex;align-items:center;justify-content:center;font-size:.72em}.snw{background:#fff;box-shadow:0 0 0 2px #222}.snb{background:#222;box-shadow:0 0 0 2px #fff}.pw{color:#fff;text-shadow:0 0 2px #000,0 0 2px #000,0 0 1px #000}.pb{color:#111;text-shadow:0 0 2px #fff}
 .coord{position:absolute;font-size:calc(var(--bs)/8*.2);opacity:.7;pointer-events:none;color:#333}
 .coord.f{right:2px;bottom:1px}.coord.r{left:2px;top:1px}
 #status{font-size:14px;text-align:center;min-height:18px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:94vw}
@@ -102,7 +102,7 @@ button:active{background:#56606b}
 /* ===== CORE (pure logic, testable) ===== */
 var SnailCore = (function(){
   var FILES='abcdefgh';
-  var SNAIL_START='a4';      // empty edge square of the middle ranks
+  var SNAIL_START=['a4','a5']; // two snails on empty edge squares of the middle ranks; they move in this order
   var SNAIL_EVERY=3;         // snail steps after every 3rd Black move
   function fx(s){return FILES.indexOf(s[0]);} function ry(s){return +s[1]-1;}
   function sq(x,y){return FILES[x]+(y+1);}
@@ -110,15 +110,15 @@ var SnailCore = (function(){
   // Build a chess.js instance where the snail square holds a blocker knight of the
   // side to move: it blocks rays (attacks/check/castling paths) and cannot be captured.
   function engine(st){
-    var f=st.fen.split(' '); if(f[3]===st.snail) f[3]='-';
+    var f=st.fen.split(' '); if(st.snails.indexOf(f[3])>=0) f[3]='-';
     var g=new Chess(); g.load(f.join(' '));
-    if(st.snail){ g.put({type:'n',color:st.fen.split(' ')[1]},st.snail); }
+    st.snails.forEach(function(q){ if(q) g.put({type:'n',color:st.fen.split(' ')[1]},q); });
     return g;
   }
   function legalMoves(st,from){
     if(st.over) return [];
     var g=engine(st);
-    return g.moves({verbose:true}).filter(function(m){return m.from!==st.snail && m.to!==st.snail && (!from||m.from===from);});
+    return g.moves({verbose:true}).filter(function(m){return st.snails.indexOf(m.from)<0 && st.snails.indexOf(m.to)<0 && (!from||m.from===from);});
   }
   function findKing(g,color){var b=g.board();for(var r=0;r<8;r++)for(var c=0;c<8;c++){var p=b[r][c];if(p&&p.type==='k'&&p.color===color)return FILES[c]+(8-r);}return null;}
   function fixCastling(fen){
@@ -130,28 +130,45 @@ var SnailCore = (function(){
     if(p[2].indexOf('q')>=0&&is('e8','k','b')&&is('a8','r','b'))c+='q';
     p[2]=c||'-';return p.join(' ');
   }
-  function posKey(st){return st.fen.split(' ').slice(0,4).join(' ')+' '+st.snail;}
-  function newGame(fen,snail){
-    var st={fen:fen||'rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1',snail:snail||SNAIL_START,
+  function posKey(st){return st.fen.split(' ').slice(0,4).join(' ')+' '+st.snails.join(',');}
+  function newGame(fen,snails){
+    var st={fen:fen||'rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1',snails:(typeof snails==='string'?[snails]:snails||SNAIL_START).slice(),
       blackMoves:0,last:null,trail:[],over:null,reps:{}};
     st.reps[posKey(st)]=1; evaluate(st); return st;
   }
   function clone(st){return JSON.parse(JSON.stringify(st));}
-  // Snail target: nearest king (Chebyshev); tie -> king of the side to move (White, since it moves after Black).
-  function snailStep(st){
-    var g=new Chess();g.load(st.fen);var turn=st.fen.split(' ')[1];
-    var ks=[findKing(g,turn),findKing(g,turn==='w'?'b':'w')].filter(Boolean);
-    var sx=fx(st.snail),sy=ry(st.snail),best=null,bd=99;
-    ks.forEach(function(k){var d=Math.max(Math.abs(fx(k)-sx),Math.abs(ry(k)-sy));if(d<bd){bd=d;best=k;}});
+  // Snail 0 is the WHITE snail (starts a4) and hunts the BLACK king; snail 1 is the BLACK snail
+  // (starts a5) and hunts the WHITE king. White snail moves first; if it kills a king the black one stays put.
+  // Step choice among the 8 neighbours that are on-board, not the other snail, and strictly closer
+  // (Chebyshev) to the target king, ranked by: Chebyshev distance, then avoid own-colour pieces
+  // (own king worst), then the direct diagonal-first step, then squared distance, file, rank.
+  // If no square qualifies the snail waits. It destroys whatever it steps on (own pieces included).
+  function snailTurn(st){
+    st.trail=[];
+    for(var i=0;i<st.snails.length&&!st.over;i++) if(st.snails[i]) snailStep(st,i);
+  }
+  function snailStep(st,i){
+    var g=new Chess();g.load(st.fen);
+    var mine=i===0?'w':'b',best=findKing(g,mine==='w'?'b':'w');
     if(!best) return;
-    var to=sq(sx+sign(fx(best)-sx),sy+sign(ry(best)-sy));
-    var victim=g.get(to); var from=st.snail; st.snail=to; st.trail=[from,to];
+    var cur=st.snails[i],sx=fx(cur),sy=ry(cur),kx=fx(best),ky=ry(best);
+    var bd=Math.max(Math.abs(kx-sx),Math.abs(ky-sy)),dxd=sx+sign(kx-sx),dyd=sy+sign(ky-sy),c=[];
+    for(var dx=-1;dx<=1;dx++)for(var dy=-1;dy<=1;dy++){var x=sx+dx,y=sy+dy;
+      if(!(dx||dy)||x<0||x>7||y<0||y>7||st.snails.indexOf(sq(x,y))>=0)continue;
+      var ch=Math.max(Math.abs(kx-x),Math.abs(ky-y));if(ch>=bd)continue;
+      var pc=g.get(sq(x,y)),own=pc&&pc.color===mine?(pc.type==='k'?2:1):0;
+      c.push([ch,own,(x===dxd&&y===dyd)?0:1,(kx-x)*(kx-x)+(ky-y)*(ky-y),x,y]);}
+    c.sort(function(a,b){for(var k=0;k<6;k++)if(a[k]!==b[k])return a[k]-b[k];return 0;});
+    if(!c.length) return;
+    var to=sq(c[0][4],c[0][5]),victim=g.get(to);
+    st.snails[i]=to; st.trail.push(cur,to);
+    var q=st.fen.split(' ');q[3]='-';
     if(victim){
-      g.remove(to);
-      var p=g.fen().split(' '); p[0]=g.fen().split(' ')[0]; p[3]='-'; // clear en passant
-      st.fen=fixCastling(p.join(' '));
-      if(victim.type==='k'){ st.over={type:'snail',winner:victim.color==='w'?'b':'w',msg:'\ud83d\udc0c The snail crushed the '+(victim.color==='w'?'White':'Black')+' king! '+(victim.color==='w'?'Black':'White')+' wins.'}; }
-    } else { var q=st.fen.split(' ');q[3]='-';st.fen=q.join(' '); }
+      g.remove(to); q[0]=g.fen().split(' ')[0];
+      st.fen=fixCastling(q.join(' '));
+      if(victim.type==='k'){ var vn=victim.color==='w'?'White':'Black',wn=victim.color==='w'?'Black':'White';
+        st.over={type:'snail',winner:victim.color==='w'?'b':'w',msg:'\ud83d\udc0c The '+(mine==='w'?'white':'black')+' snail crushed the '+vn+' king! '+wn+' wins.'}; }
+    } else st.fen=q.join(' ');
   }
   function insufficient(fen){
     var b=fen.split(' ')[0].replace(/[\/1-8kK]/g,'');
@@ -164,7 +181,7 @@ var SnailCore = (function(){
     var turn=st.fen.split(' ')[1],name=turn==='w'?'White':'Black';
     // Opponent king left en prise (only possible after a snail destroys a shield)
     var t=st.fen.split(' ');t[1]=turn==='w'?'b':'w';t[3]='-';
-    var o=engine({fen:t.join(' '),snail:st.snail});
+    var o=engine({fen:t.join(' '),snails:st.snails});
     if(o.in_check()){st.over={type:'exposed',winner:turn,msg:(turn==='w'?'Black':'White')+'\u2019s king was left exposed by the snail. '+name+' wins.'};return st.over;}
     var g=engine(st),ms=legalMoves(st),chk=g.in_check();
     st.check=chk?findKing(g,turn):null;
@@ -183,9 +200,9 @@ var SnailCore = (function(){
     var ns=clone(st),g=engine(ns),mover=ns.fen.split(' ')[1];
     var m=g.move({from:from,to:to,promotion:cand[0].promotion});
     if(!m) return null;
-    if(ns.snail) g.remove(ns.snail);
+    ns.snails.forEach(function(q){ if(q) g.remove(q); });
     ns.fen=g.fen(); ns.last={from:from,to:to,san:m.san}; ns.trail=[]; ns.check=null;
-    if(mover==='b'){ ns.blackMoves++; if(ns.blackMoves%SNAIL_EVERY===0) snailStep(ns); }
+    if(mover==='b'){ ns.blackMoves++; if(ns.blackMoves%SNAIL_EVERY===0) snailTurn(ns); }
     var k=posKey(ns); ns.reps[k]=(ns.reps[k]||0)+1;
     evaluate(ns); return ns;
   }
@@ -214,7 +231,7 @@ if(typeof window!=='undefined'){window.onerror=function(m){__fatal(m);};}
       if(sel===name)d.classList.add('sel');
       if(st.check===name&&!st.over)d.classList.add('check');
       var p=g.get(name);
-      if(name===st.snail){d.insertAdjacentHTML('beforeend','<span class="pc sn">\ud83d\udc0c</span>');}
+      if(st.snails.indexOf(name)>=0){d.insertAdjacentHTML('beforeend','<span class="pc sn '+(st.snails.indexOf(name)===0?'snw':'snb')+'" title="'+(st.snails.indexOf(name)===0?'White':'Black')+' snail">\ud83d\udc0c</span>');}
       else if(p){d.insertAdjacentHTML('beforeend','<span class="pc '+(p.color==='w'?'pw':'pb')+'">'+GLYPH[p.type]+'\uFE0E</span>');}
       var t=targets.filter(function(m){return m.to===name;})[0];
       if(t)d.insertAdjacentHTML('beforeend',(p||t.flags.indexOf('e')>=0)?'<span class="ring"></span>':'<span class="dot"></span>');
@@ -223,7 +240,7 @@ if(typeof window!=='undefined'){window.onerror=function(m){__fatal(m);};}
       boardEl.appendChild(d);
     }
     var turn=st.fen.split(' ')[1]==='w'?'White':'Black',left=SnailCore.SNAIL_EVERY-st.blackMoves%SNAIL_EVERY;
-    statusEl.textContent=st.over?st.over.msg:(turn+' to move'+(st.check?' \u2014 CHECK!':'')+' \u00b7 \ud83d\udc0c moves in '+left+' Black move'+(left>1?'s':''));
+    statusEl.textContent=st.over?st.over.msg:(turn+' to move'+(st.check?' \u2014 CHECK!':'')+' \u00b7 \ud83d\udc0c\ud83d\udc0c move in '+left+' Black move'+(left>1?'s':''));
     document.getElementById('undoBtn').disabled=!hist.length;
   }
   var SNAIL_EVERY=SnailCore.SNAIL_EVERY;
